@@ -1,0 +1,200 @@
+# Workflow to build and deploy a Next.js site to GitHub Pages
+name: Deploy
+
+on:
+  push:
+    branches: ["main"]
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete all artifacts in org repos
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const org = 'iDataVisualizationLab';
+
+            try {
+              // Get all repositories in the org
+              const repos = await github.paginate(github.rest.repos.listForOrg, {
+                org,
+                per_page: 100
+              });
+
+              for (const repo of repos) {
+                console.log(`📦 Checking artifacts in ${repo.name}...`);
+
+                let artifacts = [];
+                try {
+                  artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+                    owner: org,
+                    repo: repo.name,
+                    per_page: 100
+                  });
+                } catch (err) {
+                  console.warn(`⚠️ Failed to list artifacts for ${repo.name}: ${err.message}`);
+                  continue;
+                }
+
+                if (artifacts.length === 0) {
+                  console.log(`✅ No artifacts in ${repo.name}`);
+                  continue;
+                }
+
+                for (const artifact of artifacts) {
+                  try {
+                    console.log(`🗑️ Deleting ${artifact.name} in ${repo.name}`);
+                    await github.rest.actions.deleteArtifact({
+                      owner: org,
+                      repo: repo.name,
+                      artifact_id: artifact.id,
+                    });
+                  } catch (err) {
+                    console.warn(`⚠️ Failed to delete ${artifact.name} in ${repo.name}: ${err.message}`);
+                  }
+                }
+
+                console.log(`✅ Finished ${repo.name}`);
+              }
+
+              console.log("🎉 All repositories processed.");
+            } catch (err) {
+              console.error(`❌ Unexpected error: ${err.message}`);
+              core.setFailed(err.message);
+            }
+
+      - name: Clean up workspace
+        run: |
+          sudo rm -rf $HOME/.npm
+          sudo rm -rf $HOME/.cache
+          sudo apt-get clean
+          sudo rm -rf /tmp/*
+
+      - name: Aggressive Clean Up
+        run: |
+          echo "Freeing disk space..."
+          sudo rm -rf $HOME/.npm
+          sudo rm -rf $HOME/.cache
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/lib/jvm
+          sudo apt-get clean
+          sudo rm -rf /tmp/*
+          sudo journalctl --rotate
+          sudo journalctl --vacuum-time=1s
+          echo "Remaining space:"
+          df -h
+      
+      - name: Delete Old Artifacts
+        uses: actions/github-script@v6
+        id: artifact
+        with:
+          script: |
+            if (context.repo.owner === 'iDataVisualizationLab') {
+              const res = await github.rest.actions.listArtifactsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+
+              for (const { id } of res.data.artifacts) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: id,
+                });
+              }
+
+              console.log(`Deleted ${res.data.artifacts.length} artifacts.`);
+            } else {
+              console.log("Skipping artifact deletion: not in the main repo context.");
+            }
+      - name: Delete All Artifacts
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const res = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            console.log(`Found ${res.data.artifacts.length} artifacts`);
+            for (const { id, name, size_in_bytes, created_at } of res.data.artifacts) {
+              console.log(`Deleting ${name} (${(size_in_bytes / 1024 / 1024).toFixed(2)} MB) created at ${created_at}`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: id,
+              });
+            }
+
+            console.log("All deletions attempted.");
+  build:
+    needs: cleanup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-
+
+      - name: Install dependencies
+        run: npm install --force
+
+      - name: Set deployment environment variable
+        run: echo "NEXT_PUBLIC_DEPLOYMENT=PRODUCTION" >> $GITHUB_ENV
+
+      - name: Set Version Environment Variable
+        run: echo "NEXT_PUBLIC_VERSION=$VERSION" >> $GITHUB_ENV
+      
+      - name: Set NEXT_PUBLIC_REPO_NAME
+        run: |
+          echo "NEXT_PUBLIC_REPO_NAME=${{ github.event.repository.name }}" >> $GITHUB_ENV
+
+      - name: Build Next.js site
+        run: npm run build
+
+      - name: Upload static site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./out
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
